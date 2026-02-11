@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-sa
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::202533544682:role/backend-pod-role
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      serviceAccountName: backend-sa
+      containers:
+        - name: backend
+          image: 202533544682.dkr.ecr.ap-south-1.amazonaws.com/backend:latest
+          env:
+            - name: DB_HOST
+              value: "eks-db.chmgysw8k8th.ap-south-1.rds.amazonaws.com"
+            - name: DB_NAME
+              value: "appdb"
+            - name: DB_USER
+              value: "master_admin"
+            - name: DB_SECRET_ID
+              value: "ecs-cluster/development/db-password"
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: backend
+  ports:
+    - protocol: TCP
+      port: 80 # The port the service exposes
+      targetPort: 8080 # The port the container is listening on (must match containerPort)
+  type: ClusterIP

@@ -1,0 +1,48 @@
+# Initialize and Validate
+terraform init
+terraform validate
+
+# Provision VPC and EKS Cluster
+terraform apply -target=module.vpc -target=module.eks -auto-approve
+
+# Provision remaining resources
+terraform apply -auto-approve
+
+# Setup Parameters
+export REGION="ap-south-1"
+export CLUSTER_NAME="eks-cluster"
+export AWS_PROFILE="john"
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile $AWS_PROFILE)
+export REPO_BASE="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+
+# Update Kubeconfig
+aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME --profile $AWS_PROFILE
+
+# Authenticate Docker to ECR
+aws ecr get-login-password --region $REGION --profile $AWS_PROFILE | \
+docker login --username AWS --password-stdin $REPO_BASE
+
+# Build, Tag, and Push Backend
+docker build -t backend ./backend
+docker tag backend:latest $REPO_BASE/backend:latest
+docker push $REPO_BASE/backend:latest
+
+# Build, Tag, and Push Frontend
+docker build -t frontend ./frontend
+docker tag frontend:latest $REPO_BASE/frontend:latest
+docker push $REPO_BASE/frontend:latest
+
+# Deploy Logic Tier
+kubectl apply -f backend.yaml
+
+# Deploy Ingress Tier
+kubectl apply -f frontend.yaml
+
+# Clean up Cloud Resources
+kubectl delete -f frontend
+kubectl delete -f backend
+terraform destroy -auto-approve
+
+# Purge local Terraform memory
+rm terraform.tfstate terraform.tfstate.backup
+rm -rf .terraform .terraform.lock.hcl
