@@ -34,10 +34,10 @@ All projects in this repository are designed and audited against the **AWS Well-
 
 ## 🗓 Project Log & Roadmap
 
-| Week       | Focus Area           | Core Services            | Key Learning Objective                                                            |
-| ---------- | -------------------- | ------------------------ | --------------------------------------------------------------------------------- |
-| **Week 3** | **Containerization** | ECS, EKS, Fargate, ECR   | Determining orchestration strategy based on operational overhead vs. flexibility. |
-| **Week 4** | **Serverless Arch**  | Lambda, API Gateway, SQS | Building event-driven, decoupled enterprise applications.                         |
+| Week       | Module                                     |
+| ---------- | ------------------------------------------ |
+| **Week 3** | **Compute and Elastic Scalability**        |
+| **Week 4** | **Storage and Data Lifecycle Managementh** |
 
 ---
 
