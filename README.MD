@@ -17,36 +17,28 @@ All projects in this repository are designed and audited against the **AWS Well-
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```text
 .
 ├── README.md               # Root documentation
-└── Week 3/                 # Advanced Compute and Containerization
+└── Week 2/                 # Identity, Access, and Governance
+└── Week 2/                 # Networking and Secure Connectivity
+└── Week 3/                 # Compute and Elastic Scalability
     └── ECS vs EKS/         # Comparative analysis of AWS container orchestration
-        ├── architecture/   # High-Level Design (HLD) diagrams
-        ├── terraform/      # IaC for cluster provisioning
-        └── README.md       # Project-specific documentation
+└── Week 4/                 # Storage and Data Lifecycle Managementh
 
 ```
 
 ---
 
-## 🗓 Project Log & Roadmap
+## Roadmap
 
 | Week       | Module                                     |
 | ---------- | ------------------------------------------ |
+| **Week 1** | **Identity, Access, and Governance**       |
+| **Week 2** | **Networking and Secure Connectivity**     |
 | **Week 3** | **Compute and Elastic Scalability**        |
 | **Week 4** | **Storage and Data Lifecycle Managementh** |
-
----
-
-## 🛠 Technical Standards
-
-To maintain professional software/solutions architect standards, every project must adhere to:
-
-- **Zero Hardcoding:** Use AWS Secrets Manager or Parameter Store for all configurations.
-- **Documentation:** Every sub-folder must contain a `README.md` explaining the _why_ (business case) behind the _how_ (technical implementation).
-- **Scalability:** Solutions must be designed to handle enterprise-level traffic without manual intervention.
 
 ---
