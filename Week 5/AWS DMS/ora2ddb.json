@@ -1,0 +1,55 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "SelectTripsTable",
+      "object-locator": {
+        "schema-name": "TAXI",
+        "table-name": "TRIPS"
+      },
+      "rule-action": "include"
+    },
+    {
+      "rule-type": "object-mapping",
+      "rule-id": "2",
+      "rule-name": "TransformToNoSQL",
+      "rule-action": "map-record-to-record",
+      "object-locator": {
+        "schema-name": "TAXI",
+        "table-name": "TRIPS"
+      },
+      "target-table-name": "aws-db-workshop-trips",
+      "mapping-parameters": {
+        "partition-key-name": "riderid",
+        "sort-key-name": "tripinfo",
+        "attribute-mappings": [
+          {
+            "target-attribute-name": "riderid",
+            "attribute-type": "scalar",
+            "attribute-sub-type": "string",
+            "value": "${RIDER_EMAIL}"
+          },
+          {
+            "target-attribute-name": "tripinfo",
+            "attribute-type": "scalar",
+            "attribute-sub-type": "string",
+            "value": "${PICKUP_DATETIME},${ID}"
+          },
+          {
+            "target-attribute-name": "driverid",
+            "attribute-type": "scalar",
+            "attribute-sub-type": "string",
+            "value": "${DRIVER_EMAIL}"
+          },
+          {
+            "target-attribute-name": "DriverDetails",
+            "attribute-type": "scalar",
+            "attribute-sub-type": "string",
+            "value": "{\"Name\":\"${DRIVER_NAME}\",\"VehicleDetails\":{\"id\":\"${VEHICLE_ID}\",\"type\":\"${CAB_TYPE_ID}\"}}"
+          }
+        ]
+      }
+    }
+  ]
+}
