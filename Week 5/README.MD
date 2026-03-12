@@ -1,4 +1,4 @@
-# Lab 1: Modernized Database Migration (Oracle to DynamoDB & Aurora PostgreSQL)
+# Database Migration (Oracle to DynamoDB & Aurora PostgreSQL)
 
 This repository contains declarative SQL schemas and configuration files to execute a modernized database migration. It routes data from a source Amazon RDS for Oracle instance to target Amazon Aurora PostgreSQL and Amazon DynamoDB databases utilizing AWS Database Migration Service (AWS DMS).
 
