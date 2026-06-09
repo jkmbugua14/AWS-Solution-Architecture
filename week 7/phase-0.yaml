@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PesaLink Africa — Legacy Baseline Architecture (Phase 0).
+  Recreates the fragile single-point-of-failure setup behind the KSh 18M
+  outage: one EC2 instance in a single AZ, single-AZ RDS PostgreSQL with
+  automated backups disabled, an EBS volume for receipts, and a bare Elastic
+  IP as the sole ingress path. No load balancer. No standby. No recovery plan.
+
+  The architectural weaknesses are intentional — this stack provides the
+  concrete "before" state to contrast against the resilient architecture built
+  in subsequent phases. Authored by John Kimani.
+
+  Access is via SSM Session Manager only; port 22 is not open.
+
+Parameters:
+  LatestAL2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  DBUsername:
+    Type: String
+    Default: pesalink_admin
+
+Resources:
+
+  # ---------- A minimal VPC with ONE public subnet in ONE AZ ----------
+  # (No second AZ. That single-AZ choice is the whole problem.)
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [ { Key: Name, Value: pesalink-legacy-vpc }, { Key: Project, Value: PesaLink } ]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties: { Tags: [ { Key: Name, Value: pesalink-legacy-igw } ] }
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  # Single subnet, single AZ. RDS technically needs a second subnet for its
+  # subnet group, so we add a bare one in another AZ but place the DB instance
+  # firmly in AZ-a with Multi-AZ DISABLED — faithful to "single AZ, no standby".
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags: [ { Key: Name, Value: pesalink-legacy-public }, { Key: Project, Value: PesaLink } ]
+  # Placeholder second subnet ONLY to satisfy the RDS subnet-group requirement.
+  DbSecondSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: pesalink-legacy-db-placeholder }, { Key: Project, Value: PesaLink } ]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [ { Key: Name, Value: pesalink-legacy-rt } ] }
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RouteTable, SubnetId: !Ref PublicSubnet }
+
+  # ---------- Security groups ----------
+  # NOTE: NO inbound SSH (22). Access is via SSM Session Manager only.
+  # We expose the app port to the world because there's no load balancer in
+  # front of it — that direct exposure is part of the fragile baseline.
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Legacy single box - app port open, NO ssh
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+      Tags: [ { Key: Name, Value: pesalink-legacy-sg-app }, { Key: Project, Value: PesaLink } ]
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Legacy DB - 5432 from the app box only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSg }
+      Tags: [ { Key: Name, Value: pesalink-legacy-sg-db }, { Key: Project, Value: PesaLink } ]
+
+  # ---------- IAM role: SSM access only (so we can reach the box w/o SSH) ----
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns: [ arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore ]
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [ !Ref InstanceRole ] }
+
+  # ---------- The single EC2 instance (m5.xlarge, one AZ) ----------
+  AppServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: m5.xlarge
+      ImageId: !Ref LatestAL2023Ami
+      SubnetId: !Ref PublicSubnet
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [ !Ref AppSg ]
+      # ---- EBS volume for transaction receipts (single volume, single AZ) ----
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvdf
+          Ebs: { VolumeSize: 20, VolumeType: gp3, DeleteOnTermination: true }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y nodejs
+          mkdir -p /opt/app /mnt/receipts
+          # mount the receipts EBS volume
+          mkfs -t xfs /dev/xvdf || true
+          mount /dev/xvdf /mnt/receipts || true
+          cat >/opt/app/server.js <<'JS'
+          const http=require('http');const os=require('os');
+          http.createServer((req,res)=>{
+            if(req.url==='/health'){res.writeHead(200);return res.end('OK');}
+            res.writeHead(200,{'Content-Type':'application/json'});
+            res.end(JSON.stringify({service:'pesalink-legacy',servedBy:os.hostname(),az:'single-az'}));
+          }).listen(8080,()=>console.log('legacy app on 8080'));
+          JS
+          node /opt/app/server.js &
+      Tags: [ { Key: Name, Value: pesalink-legacy-app }, { Key: Project, Value: PesaLink } ]
+
+  # ---------- Bare Elastic IP, attached directly to the instance ----------
+  # (DNS in the scenario is a single A record pointing straight at this EIP.)
+  AppEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref AppServer
+      Tags: [ { Key: Name, Value: pesalink-legacy-eip } ]
+
+  # ---------- RDS PostgreSQL: single-AZ, NO automated backups ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: legacy single-az db
+      SubnetIds: [ !Ref PublicSubnet, !Ref DbSecondSubnet ]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # No DeletionPolicy snapshot here either - faithful to "no backups".
+    Properties:
+      Engine: postgres
+      DBInstanceClass: db.m5.large
+      AllocatedStorage: '50'
+      DBName: pesalink
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true       # the ONE concession: no plaintext pw in template
+      MultiAZ: false                       # <-- single AZ, no standby
+      BackupRetentionPeriod: 0             # <-- automated backups DISABLED
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [ !Ref DbSg ]
+      Tags: [ { Key: Project, Value: PesaLink } ]
+
+Outputs:
+  AppPublicIp:
+    Description: The single Elastic IP - your one and only entry point (the SPOF)
+    Value: !Ref AppEip
+  HealthCheckUrl:
+    Value: !Sub http://${AppEip}:8080/health
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  WhatIsWrong:
+    Description: The failure modes this baseline intentionally demonstrates
+    Value: >
+      Single AZ (AZ loss = total outage); no Multi-AZ standby; automated backups
+      OFF (RPO effectively infinite); no load balancer or Auto Scaling (no self-heal);
+      single EBS volume in one AZ; single EIP as the only ingress (no failover).

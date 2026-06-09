@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PesaLink Africa — Route 53 Failover Routing (Phase 2).
+  Two health checks (one per regional ALB) and two A-record aliases:
+  Primary → af-south-1 ALB, Secondary → eu-west-1 ALB.
+  Authored by John Kimani.
+  Deploy this stack in us-east-1 — Route 53 is a global service but its
+  CloudFormation resources are managed through the us-east-1 endpoint.
+
+Parameters:
+  HostedZoneId:        { Type: String, Description: Existing Route 53 hosted zone ID }
+  RecordName:          { Type: String, Description: e.g. pesalink.yourdomain.com }
+  PrimaryAlbDnsName:   { Type: String, Description: af-south-1 ALB DNS name }
+  PrimaryAlbZoneId:    { Type: String, Description: af-south-1 ALB canonical hosted zone ID }
+  SecondaryAlbDnsName: { Type: String, Description: eu-west-1 ALB DNS name }
+  SecondaryAlbZoneId:  { Type: String, Description: eu-west-1 ALB canonical hosted zone ID }
+  PrimaryHcRegion:     { Type: String, Default: af-south-1 }
+  SecondaryHcRegion:   { Type: String, Default: eu-west-1 }
+
+Resources:
+
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !Ref PrimaryAlbDnsName
+        Port: 80
+        ResourcePath: /health
+        RequestInterval: 10
+        FailureThreshold: 2
+        MeasureLatency: false
+      HealthCheckTags: [ { Key: Name, Value: pesalink-primary-hc } ]
+
+  SecondaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !Ref SecondaryAlbDnsName
+        Port: 80
+        ResourcePath: /health
+        RequestInterval: 10
+        FailureThreshold: 2
+        MeasureLatency: false
+      HealthCheckTags: [ { Key: Name, Value: pesalink-secondary-hc } ]
+
+  # ---- Primary A record: alias to af-south-1 ALB ----
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RecordName
+      Type: A
+      SetIdentifier: primary-af-south-1
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryHealthCheck
+      AliasTarget:
+        DNSName: !Ref PrimaryAlbDnsName
+        HostedZoneId: !Ref PrimaryAlbZoneId
+        EvaluateTargetHealth: false   # explicit HC is what we want driving failover
+
+  # ---- Secondary A record: alias to eu-west-1 ALB ----
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RecordName
+      Type: A
+      SetIdentifier: secondary-eu-west-1
+      Failover: SECONDARY
+      HealthCheckId: !Ref SecondaryHealthCheck
+      AliasTarget:
+        DNSName: !Ref SecondaryAlbDnsName
+        HostedZoneId: !Ref SecondaryAlbZoneId
+        EvaluateTargetHealth: false
+
+Outputs:
+  PrimaryHcId:   { Value: !Ref PrimaryHealthCheck }
+  SecondaryHcId: { Value: !Ref SecondaryHealthCheck }
+  Record:        { Value: !Ref RecordName }

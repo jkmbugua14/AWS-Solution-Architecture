@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PesaLink Africa — Multi-AZ Foundation (af-south-1).
+  Provisions a VPC with 2 public and 2 private subnets across two AZs, an
+  internet gateway, one NAT gateway per AZ for AZ-level resilience, an
+  Application Load Balancer, an EC2 Auto Scaling Group (min 2 / max 6) on
+  AL2023 with S3-pull user data, and an Aurora PostgreSQL Multi-AZ cluster
+  (writer + reader). Authored by John Kimani.
+  This same template can be redeployed in eu-west-1 as the Phase 2 primary stack.
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+Parameters:
+  AppBucketName:
+    Type: String
+    Description: S3 bucket holding the application bundle (must be in this region).
+  AppObjectKey:
+    Type: String
+    Default: app/pesalink-app.tar.gz
+    Description: S3 key of the gzipped application tarball.
+  DBUsername:
+    Type: String
+    Default: pesalink_admin
+    Description: Aurora master username.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  LatestAL2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Always resolves to the current AL2023 AMI for this region.
+
+# ---------------------------------------------------------------------------
+# RESOURCES
+# ---------------------------------------------------------------------------
+Resources:
+  # ---------- VPC + Internet Gateway ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.7.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: pesalink-vpc }
+        - { Key: Project, Value: PesaLink }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: pesalink-igw }]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------- Subnets ----------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""] # af-south-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        [
+          { Key: Name, Value: pesalink-public-a },
+          { Key: Project, Value: PesaLink },
+        ]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""] # af-south-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        [
+          { Key: Name, Value: pesalink-public-b },
+          { Key: Project, Value: PesaLink },
+        ]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        [
+          { Key: Name, Value: pesalink-private-a },
+          { Key: Project, Value: PesaLink },
+        ]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.20.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        [
+          { Key: Name, Value: pesalink-private-b },
+          { Key: Project, Value: PesaLink },
+        ]
+
+  # ---------- NAT Gateways (one per AZ for AZ-level resilience) ----------
+  NatEipA:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: pesalink-nat-a }]
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: pesalink-nat-b }]
+
+  # ---------- Route tables ----------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-rt-public }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetA }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetB }
+
+  # Each private subnet routes 0.0.0.0/0 to the NAT in ITS OWN AZ.
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-rt-private-a }]
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      { RouteTableId: !Ref PrivateRouteTableA, SubnetId: !Ref PrivateSubnetA }
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-rt-private-b }]
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      { RouteTableId: !Ref PrivateRouteTableB, SubnetId: !Ref PrivateSubnetB }
+
+  # ---------- Security groups ----------
+  # Defined first as empty shells, then wired with separate Ingress/Egress
+  # resources to avoid circular references between SGs.
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - public ingress 80/443, egress to app on 8080
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-sg-alb }]
+  Ec2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tier - ingress 8080 from ALB, egress to DB + 443 out
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-sg-ec2 }]
+  RdsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora - ingress 5432 from app tier only
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: pesalink-sg-rds }]
+
+  # ALB ingress: 80 + 443 from anywhere
+  AlbIngressHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      {
+        GroupId: !Ref AlbSg,
+        IpProtocol: tcp,
+        FromPort: 80,
+        ToPort: 80,
+        CidrIp: 0.0.0.0/0,
+      }
+  AlbIngressHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      {
+        GroupId: !Ref AlbSg,
+        IpProtocol: tcp,
+        FromPort: 443,
+        ToPort: 443,
+        CidrIp: 0.0.0.0/0,
+      }
+  # ALB egress: only to app tier on 8080
+  AlbEgressToApp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      {
+        GroupId: !Ref AlbSg,
+        IpProtocol: tcp,
+        FromPort: 8080,
+        ToPort: 8080,
+        DestinationSecurityGroupId: !Ref Ec2Sg,
+      }
+
+  # App ingress: 8080 from ALB only
+  Ec2IngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      {
+        GroupId: !Ref Ec2Sg,
+        IpProtocol: tcp,
+        FromPort: 8080,
+        ToPort: 8080,
+        SourceSecurityGroupId: !Ref AlbSg,
+      }
+  # App egress: to DB on 5432, and 443 out (via NAT) for S3 + Secrets Manager
+  Ec2EgressToDb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      {
+        GroupId: !Ref Ec2Sg,
+        IpProtocol: tcp,
+        FromPort: 5432,
+        ToPort: 5432,
+        DestinationSecurityGroupId: !Ref RdsSg,
+      }
+  Ec2EgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      {
+        GroupId: !Ref Ec2Sg,
+        IpProtocol: tcp,
+        FromPort: 443,
+        ToPort: 443,
+        CidrIp: 0.0.0.0/0,
+      }
+
+  # DB ingress: 5432 from app tier only
+  RdsIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      {
+        GroupId: !Ref RdsSg,
+        IpProtocol: tcp,
+        FromPort: 5432,
+        ToPort: 5432,
+        SourceSecurityGroupId: !Ref Ec2Sg,
+      }
+
+  # ---------- Aurora PostgreSQL (Multi-AZ: writer + reader) ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: PesaLink Aurora subnet group (both private subnets)
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      Tags: [{ Key: Project, Value: PesaLink }]
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: pesalink
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true # password stored in a managed Secrets Manager secret
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref RdsSg]
+      BackupRetentionPeriod: 35 # 35-day automated backups + PITR
+      StorageEncrypted: true
+      Tags: [{ Key: Project, Value: PesaLink }]
+
+  AuroraWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.r6g.large
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Project, Value: PesaLink }]
+  AuroraReader:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.r6g.large
+      AvailabilityZone: !Select [1, !GetAZs ""] # reader in the OTHER AZ
+      Tags: [{ Key: Project, Value: PesaLink }]
+
+  # ---------- IAM: instance role w/ S3 + Secrets Manager read ----------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore # lets you use SSM Session Manager instead of SSH
+      Policies:
+        - PolicyName: pesalink-app-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub arn:aws:s3:::${AppBucketName}/*
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  # ---------- Launch Template (S3-pull user-data) ----------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: pesalink-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAL2023Ami
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref Ec2Sg]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              [
+                { Key: Name, Value: pesalink-app },
+                { Key: Project, Value: PesaLink },
+              ]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y nodejs
+            mkdir -p /opt/app && cd /opt/app
+            # Pull the application bundle from S3 (instance role grants GetObject)
+            aws s3 cp s3://${AppBucketName}/${AppObjectKey} /opt/app/app.tar.gz
+            tar -xzf app.tar.gz -C /opt/app
+            # Make the DB endpoints + secret ARN available to the app
+            cat >/etc/pesalink.env <<EOF
+            DB_CLUSTER_ENDPOINT=${AuroraCluster.Endpoint.Address}
+            DB_READER_ENDPOINT=${AuroraCluster.ReadEndpoint.Address}
+            DB_SECRET_ARN=${AuroraCluster.MasterUserSecret.SecretArn}
+            AWS_REGION=${AWS::Region}
+            PORT=8080
+            EOF
+            # Run as a systemd service so it restarts on crash
+            cat >/etc/systemd/system/pesalink.service <<'EOF'
+            [Unit]
+            Description=PesaLink app
+            After=network.target
+            [Service]
+            EnvironmentFile=/etc/pesalink.env
+            ExecStart=/usr/bin/node /opt/app/server.js
+            Restart=always
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now pesalink
+
+  # ---------- Application Load Balancer ----------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: pesalink-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSg]
+      Tags: [{ Key: Project, Value: PesaLink }]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: pesalink-tg
+      VpcId: !Ref Vpc
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "60" }
+      Tags: [{ Key: Project, Value: PesaLink }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  # ---------- Auto Scaling Group ----------
+  Asg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: pesalink-asg
+      MinSize: "2"
+      MaxSize: "6"
+      DesiredCapacity: "2"
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup] # ASG-managed registration (not manual)
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - { Key: Name, Value: pesalink-app, PropagateAtLaunch: true }
+        - { Key: Project, Value: PesaLink, PropagateAtLaunch: true }
+
+  CpuTargetTracking:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Asg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 65.0
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------------------------
+Outputs:
+  AlbDnsName:
+    Description: Public DNS of the ALB - hit http://<this>/health
+    Value: !GetAtt Alb.DNSName
+  ClusterEndpoint:
+    Description: Aurora writer (cluster) endpoint - app uses this for writes
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  ReaderEndpoint:
+    Description: Aurora reader endpoint - app uses this for read queries
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+  TargetGroupArn:
+    Value: !Ref TargetGroup

@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PesaLink Africa — Pilot Light DR Foundation (Phase 2).
+  One template, two stacks — deployment mode (primary vs. DR) is a parameter.
+  Primary (af-south-1): ASG desired=2, creates a new Aurora Global cluster.
+  DR      (eu-west-1):  ASG desired=0, joins the existing Global cluster.
+  Authored by John Kimani.
+
+Parameters:
+  # ---- What kind of deployment is this? ----
+  DeploymentRole:
+    Type: String
+    AllowedValues: [primary, dr]
+    Description: primary = live region; dr = pilot light standby
+
+  # ---- App bundle in S3 (must be a bucket IN this region) ----
+  AppBucketName: { Type: String }
+  AppObjectKey: { Type: String, Default: app/pesalink-app.tar.gz }
+
+  # ---- Aurora Global Database wiring ----
+  # When DeploymentRole=primary: leave GlobalClusterIdentifier blank, we'll create one.
+  # When DeploymentRole=dr:      pass the global cluster id created by the primary stack.
+  GlobalClusterIdentifier:
+    Type: String
+    Default: ""
+    Description: Required only for DR; leave blank for primary.
+  DBUsername: { Type: String, Default: pesalink_admin }
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Aurora master password, min 12 chars. Required for primary; pass placeholder for DR.
+    Default: "placeholder-not-used-for-dr"
+  InstanceType: { Type: String, Default: t3.medium }
+  LatestAL2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# ---------------------------------------------------------------------------
+Conditions:
+  IsPrimary: !Equals [!Ref DeploymentRole, primary]
+  IsDr: !Equals [!Ref DeploymentRole, dr]
+
+# ---------------------------------------------------------------------------
+Resources:
+  # ============ VPC + networking (identical in both regions) ============
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.7.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        [
+          { Key: Name, Value: !Sub "pesalink-vpc-${DeploymentRole}" },
+          { Key: Project, Value: PesaLink },
+        ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      { Tags: [{ Key: Name, Value: !Sub "pesalink-igw-${DeploymentRole}" }] }
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: pesalink-public-a }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: pesalink-public-b }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: pesalink-private-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.7.20.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: pesalink-private-b }]
+
+  NatEipA: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+  NatEipB: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      {
+        AllocationId: !GetAtt NatEipA.AllocationId,
+        SubnetId: !Ref PublicSubnetA,
+      }
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      {
+        AllocationId: !GetAtt NatEipB.AllocationId,
+        SubnetId: !Ref PublicSubnetB,
+      }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssocA:
+    {
+      Type: AWS::EC2::SubnetRouteTableAssociation,
+      Properties:
+        { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetA },
+    }
+  PublicAssocB:
+    {
+      Type: AWS::EC2::SubnetRouteTableAssociation,
+      Properties:
+        { RouteTableId: !Ref PublicRouteTable, SubnetId: !Ref PublicSubnetB },
+    }
+
+  PrivateRouteTableA:
+    { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      {
+        RouteTableId: !Ref PrivateRouteTableA,
+        DestinationCidrBlock: 0.0.0.0/0,
+        NatGatewayId: !Ref NatGatewayA,
+      }
+  PrivateAssocA:
+    {
+      Type: AWS::EC2::SubnetRouteTableAssociation,
+      Properties:
+        {
+          RouteTableId: !Ref PrivateRouteTableA,
+          SubnetId: !Ref PrivateSubnetA,
+        },
+    }
+  PrivateRouteTableB:
+    { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      {
+        RouteTableId: !Ref PrivateRouteTableB,
+        DestinationCidrBlock: 0.0.0.0/0,
+        NatGatewayId: !Ref NatGatewayB,
+      }
+  PrivateAssocB:
+    {
+      Type: AWS::EC2::SubnetRouteTableAssociation,
+      Properties:
+        {
+          RouteTableId: !Ref PrivateRouteTableB,
+          SubnetId: !Ref PrivateSubnetB,
+        },
+    }
+
+  # ============ Security groups ============
+  AlbSg:
+    {
+      Type: AWS::EC2::SecurityGroup,
+      Properties: { GroupDescription: alb, VpcId: !Ref Vpc },
+    }
+  Ec2Sg:
+    {
+      Type: AWS::EC2::SecurityGroup,
+      Properties: { GroupDescription: app, VpcId: !Ref Vpc },
+    }
+  RdsSg:
+    {
+      Type: AWS::EC2::SecurityGroup,
+      Properties: { GroupDescription: db, VpcId: !Ref Vpc },
+    }
+
+  AlbIngressHttp:
+    {
+      Type: AWS::EC2::SecurityGroupIngress,
+      Properties:
+        {
+          GroupId: !Ref AlbSg,
+          IpProtocol: tcp,
+          FromPort: 80,
+          ToPort: 80,
+          CidrIp: 0.0.0.0/0,
+        },
+    }
+  AlbIngressHttps:
+    {
+      Type: AWS::EC2::SecurityGroupIngress,
+      Properties:
+        {
+          GroupId: !Ref AlbSg,
+          IpProtocol: tcp,
+          FromPort: 443,
+          ToPort: 443,
+          CidrIp: 0.0.0.0/0,
+        },
+    }
+  AlbEgressToApp:
+    {
+      Type: AWS::EC2::SecurityGroupEgress,
+      Properties:
+        {
+          GroupId: !Ref AlbSg,
+          IpProtocol: tcp,
+          FromPort: 8080,
+          ToPort: 8080,
+          DestinationSecurityGroupId: !Ref Ec2Sg,
+        },
+    }
+  Ec2IngressFromAlb:
+    {
+      Type: AWS::EC2::SecurityGroupIngress,
+      Properties:
+        {
+          GroupId: !Ref Ec2Sg,
+          IpProtocol: tcp,
+          FromPort: 8080,
+          ToPort: 8080,
+          SourceSecurityGroupId: !Ref AlbSg,
+        },
+    }
+  Ec2EgressToDb:
+    {
+      Type: AWS::EC2::SecurityGroupEgress,
+      Properties:
+        {
+          GroupId: !Ref Ec2Sg,
+          IpProtocol: tcp,
+          FromPort: 5432,
+          ToPort: 5432,
+          DestinationSecurityGroupId: !Ref RdsSg,
+        },
+    }
+  Ec2EgressHttps:
+    {
+      Type: AWS::EC2::SecurityGroupEgress,
+      Properties:
+        {
+          GroupId: !Ref Ec2Sg,
+          IpProtocol: tcp,
+          FromPort: 443,
+          ToPort: 443,
+          CidrIp: 0.0.0.0/0,
+        },
+    }
+  RdsIngressFromApp:
+    {
+      Type: AWS::EC2::SecurityGroupIngress,
+      Properties:
+        {
+          GroupId: !Ref RdsSg,
+          IpProtocol: tcp,
+          FromPort: 5432,
+          ToPort: 5432,
+          SourceSecurityGroupId: !Ref Ec2Sg,
+        },
+    }
+
+  # ============ Aurora ============
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: pesalink subnet group
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  # PRIMARY regional cluster — explicit password (Global DB requires this; managed master not allowed).
+  AuroraClusterPrimary:
+    Type: AWS::RDS::DBCluster
+    Condition: IsPrimary
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: pesalink
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref RdsSg]
+      BackupRetentionPeriod: 35
+      StorageEncrypted: true
+
+  # GLOBAL CLUSTER wraps the regional cluster (inherits encryption from it).
+  AuroraGlobal:
+    Type: AWS::RDS::GlobalCluster
+    Condition: IsPrimary
+    DeletionPolicy: Retain
+    DependsOn: AuroraClusterPrimary
+    Properties:
+      GlobalClusterIdentifier: pesalink-global
+      SourceDBClusterIdentifier: !GetAtt AuroraClusterPrimary.DBClusterArn
+      DeletionProtection: false
+
+  # DR regional cluster — joins the existing global, NO MasterUsername (read-only secondary).
+  AuroraClusterDr:
+    Type: AWS::RDS::DBCluster
+    Condition: IsDr
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref RdsSg]
+      StorageEncrypted: true
+      # Cross-region replica of an encrypted cluster requires an explicit KMS key in this region.
+      KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/rds"
+
+  AuroraWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier:
+        !If [IsPrimary, !Ref AuroraClusterPrimary, !Ref AuroraClusterDr]
+      Engine: aurora-postgresql
+      DBInstanceClass: db.r6g.large
+      AvailabilityZone: !Select [0, !GetAZs ""]
+  AuroraReader:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier:
+        !If [IsPrimary, !Ref AuroraClusterPrimary, !Ref AuroraClusterDr]
+      Engine: aurora-postgresql
+      DBInstanceClass: db.r6g.large
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  # ============ IAM + Launch Template ============
+  # Secrets Manager access only on primary (DR has no master secret of its own;
+  # promotion creates one). The DR app role uses a placeholder ARN -
+  # in real failover you'd swap to the promoted secret.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          [
+            {
+              Effect: Allow,
+              Principal: { Service: ec2.amazonaws.com },
+              Action: sts:AssumeRole,
+            },
+          ]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: pesalink-app-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {
+                  Effect: Allow,
+                  Action: [s3:GetObject],
+                  Resource: !Sub "arn:aws:s3:::${AppBucketName}/*",
+                }
+              - {
+                  Effect: Allow,
+                  Action: [secretsmanager:GetSecretValue],
+                  Resource: "*",
+                } # narrowed in production
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "pesalink-lt-${DeploymentRole}"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAL2023Ami
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref Ec2Sg]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              [
+                { Key: Name, Value: !Sub "pesalink-app-${DeploymentRole}" },
+                { Key: Project, Value: PesaLink },
+              ]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nodejs
+              mkdir -p /opt/app && cd /opt/app
+              aws s3 cp s3://${AppBucketName}/${AppObjectKey} /opt/app/app.tar.gz
+              tar -xzf app.tar.gz -C /opt/app
+              cat >/etc/pesalink.env <<EOF
+              DB_CLUSTER_ENDPOINT=${ClusterEp}
+              DB_READER_ENDPOINT=${ReaderEp}
+              AWS_REGION=${AWS::Region}
+              DEPLOYMENT_ROLE=${DeploymentRole}
+              PORT=8080
+              EOF
+              cat >/etc/systemd/system/pesalink.service <<'EOF'
+              [Unit]
+              Description=PesaLink app
+              After=network.target
+              [Service]
+              EnvironmentFile=/etc/pesalink.env
+              ExecStart=/usr/bin/node /opt/app/server.js
+              Restart=always
+              User=root
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now pesalink
+            - ClusterEp:
+                !If [
+                  IsPrimary,
+                  !GetAtt AuroraClusterPrimary.Endpoint.Address,
+                  !GetAtt AuroraClusterDr.Endpoint.Address,
+                ]
+              ReaderEp:
+                !If [
+                  IsPrimary,
+                  !GetAtt AuroraClusterPrimary.ReadEndpoint.Address,
+                  !GetAtt AuroraClusterDr.ReadEndpoint.Address,
+                ]
+
+  # ============ ALB + TG + ASG ============
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "pesalink-alb-${DeploymentRole}"
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSg]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "pesalink-tg-${DeploymentRole}"
+      VpcId: !Ref Vpc
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        [{ Key: deregistration_delay.timeout_seconds, Value: "60" }]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  # Desired capacity is the key difference: primary=2, dr=0 (pilot light).
+  Asg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "pesalink-asg-${DeploymentRole}"
+      MinSize: !If [IsPrimary, "2", "0"]
+      MaxSize: "6"
+      DesiredCapacity: !If [IsPrimary, "2", "0"]
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - {
+            Key: Name,
+            Value: !Sub "pesalink-app-${DeploymentRole}",
+            PropagateAtLaunch: true,
+          }
+        - { Key: Project, Value: PesaLink, PropagateAtLaunch: true }
+
+  CpuTargetTracking:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref Asg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 65.0
+
+# ---------------------------------------------------------------------------
+Outputs:
+  AlbDnsName: { Value: !GetAtt Alb.DNSName }
+  AlbHostedZoneId: { Value: !GetAtt Alb.CanonicalHostedZoneID }
+  TargetGroupArn: { Value: !Ref TargetGroup }
+  AsgName: { Value: !Ref Asg }
+  ClusterEndpoint:
+    Value:
+      !If [
+        IsPrimary,
+        !GetAtt AuroraClusterPrimary.Endpoint.Address,
+        !GetAtt AuroraClusterDr.Endpoint.Address,
+      ]
+  ReaderEndpoint:
+    Value:
+      !If [
+        IsPrimary,
+        !GetAtt AuroraClusterPrimary.ReadEndpoint.Address,
+        !GetAtt AuroraClusterDr.ReadEndpoint.Address,
+      ]
+  GlobalClusterId:
+    Condition: IsPrimary
+    Value: !Ref AuroraGlobal
+    Description: Pass this to the DR stack as GlobalClusterIdentifier
